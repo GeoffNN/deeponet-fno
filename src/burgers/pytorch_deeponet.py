@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import matplotlib.pyplot as plt
 
+
+import functools
 import os
 import time
 import operator
@@ -14,6 +16,8 @@ from functools import partial
 from timeit import default_timer
 from utilities3 import *
 import scipy
+
+import theseus as th
 
 import deepxde as dde
 
@@ -64,13 +68,20 @@ class BurgersDeepONetDataset(Dataset):
         ].float()
 
 
+def reduce_last_dim(mat, w):
+    return (mat * w[:, None]).sum(-1)
+    
+
+
 class LitDeepOnet(pl.LightningModule):
-    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False):
+    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600):
         super().__init__()
         self.lr = lr
         self.nx = nx
         self.viscosity = viscosity
         self.n_samples = n_samples
+        self.constrain = constrain
+        self.N_basis = N_basis
 
         self.trunk_net = nn.Sequential(
             nn.Linear(2, 128),
@@ -81,7 +92,7 @@ class LitDeepOnet(pl.LightningModule):
             nn.Tanh(),
             nn.Linear(128, 128),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(128, 128 if not self.constrain else N_basis),
         )
 
         self.branch_net = nn.Sequential(
@@ -100,9 +111,91 @@ class LitDeepOnet(pl.LightningModule):
 
         self.save_hyperparameters()
 
-    def constrained_branch(self):
+
+    def fit_linear_combo(self, ic_vals, grid):
         # Build least squares objective
-        pass
+
+        # Forward pass on the basis functions
+        batch_size = grid.shape[0]
+        idx = torch.stack([torch.randperm(self.nx * self.nx)[:self.n_samples] for i in range(batch_size)], 0)
+        flat_grid = grid.reshape(batch_size, -1, 2)
+
+        # Make this better
+        flat_sampled_grid = torch.stack([
+            flat_grid[k][idx[k]]
+            for k in range(batch_size)
+        ], 0)
+        flat_sampled_grid = flat_sampled_grid.reshape(-1, 2).detach() # Need to make it flat to compute jacobians
+
+        flat_sampled_grid.requires_grad = True
+        pred = self.trunk_net(flat_sampled_grid)
+
+        residual, dy_x, dy_t, dy_xx = self.pde(flat_sampled_grid, pred)
+        residual = residual.reshape(batch_size, self.n_samples, self.N_basis)
+        dy_x =  dy_x.reshape(batch_size, self.n_samples, self.N_basis)
+        dy_t = dy_t.reshape(batch_size, self.n_samples, self.N_basis)
+        dy_xx = dy_xx.reshape(batch_size, self.n_samples, self.N_basis)
+        pred = pred.reshape(batch_size, self.n_samples, self.N_basis)
+
+        def quad_error_fn(optim_vars, aux_vars):
+            # TODO: Add IC / BC 
+            y, dy_x, dy_t, dy_xx = aux_vars 
+            w, = optim_vars
+            y_tensor, dy_x_tensor, dy_t_tensor, dy_xx_tensor = map(functools.partial(reduce_last_dim, w=w.tensor), (y.tensor, dy_x.tensor, dy_t.tensor, dy_xx.tensor))
+            residual_tensor = dy_t_tensor + y_tensor * dy_x_tensor - self.viscosity / np.pi * dy_xx_tensor
+
+            return residual_tensor
+
+        def ridge_error_fn(optim_vars, aux_vars):
+            del aux_vars 
+            w, = optim_vars
+            # TODO: ridge scale as a model parameter
+            return 1e-7 * w.tensor.reshape(batch_size, self.N_basis)
+        
+        objective = th.Objective()
+        objective.device = pred.device
+        w_th = th.Vector(self.N_basis, name='w')  # Linear combination weight 
+        y_th = th.Variable(pred, 'y')
+        dy_x_th = th.Variable(dy_x, 'dy_x')
+        dy_t_th = th.Variable(dy_t, 'dy_t')
+        dy_xx_th = th.Variable(dy_xx, 'dy_xx') 
+
+        optim_vars = [w_th]
+        aux_vars = [y_th, dy_x_th, dy_t_th, dy_xx_th]
+
+        cost_function = th.AutoDiffCostFunction(
+            optim_vars, quad_error_fn, dim=self.n_samples,  # TODO: Update to n_samples + n_ic + n_bc
+             aux_vars=aux_vars, name="pde_residual_cost_fn"
+        )
+        ridge_function = th.AutoDiffCostFunction(
+            optim_vars, quad_error_fn, dim=self.N_basis,  # TODO: Update to n_samples + n_ic + n_bc
+             aux_vars=aux_vars, name="ridge"
+        )
+        objective = th.Objective()
+        objective.to(pred.device)
+        objective.add(cost_function)
+        # objective.add(ridge_function)
+
+        optimizer = th.LevenbergMarquardt(
+            objective,
+            max_iterations=50,
+            step_size=0.5,
+        )
+        theseus_optim = th.TheseusLayer(optimizer)
+
+        theseus_inputs = {
+            "dy_x": dy_x,
+            "dy_t": dy_t,
+            "dy_xx": dy_xx,
+            "y": pred,
+            "w": torch.rand(batch_size, self.N_basis, device=pred.device)
+        }
+
+        updated_inputs, info = theseus_optim.forward(theseus_inputs)
+
+        w = updated_inputs['w']
+        return w
+
 
     def flat_forward(self, ic_vals, grid):
         """
@@ -113,9 +206,16 @@ class LitDeepOnet(pl.LightningModule):
           pred: shape (-1, 1)
         """
         grid = grid.reshape(-1, self.nx, self.nx, 2)
-        trunk_rep = self.trunk_net(grid)
-        branch_rep = self.branch_net(ic_vals)[:, None, None]
-        output = (trunk_rep * branch_rep).sum(-1, keepdim=True)
+        batch_size = grid.shape[0]
+        if self.constrain:
+            trunk_rep = self.trunk_net(grid).reshape(batch_size, -1, self.N_basis)
+            w = self.fit_linear_combo(ic_vals, grid)  # This is the branch rep
+            return reduce_last_dim(trunk_rep, w).reshape(-1, 1)
+
+        else:
+            trunk_rep = self.trunk_net(grid)
+            branch_rep = self.branch_net(ic_vals)[:, None, None]
+            output = (trunk_rep * branch_rep).sum(-1, keepdim=True)
         return output.reshape(-1, 1)
 
     def forward(self, ic_vals, grid):
@@ -131,11 +231,18 @@ class LitDeepOnet(pl.LightningModule):
         return (trunk_rep * branch_rep).sum(-1, keepdim=True)
 
     def pde(self, x, y):
-        dy_x = dde.grad.jacobian(y, x, i=0, j=0)
-        dy_t = dde.grad.jacobian(y, x, i=0, j=1)
-        dy_xx = dde.grad.hessian(y, x, i=0, j=0)
+        N_basis = y.shape[-1]
+        if N_basis == 1:
+            dy_x = dde.grad.jacobian(y, x, i=0, j=0)
+            dy_t = dde.grad.jacobian(y, x, i=0, j=1)
+            dy_xx = dde.grad.hessian(y, x, i=0, j=0)
+        else:
+            dy_x = torch.stack([dde.grad.jacobian(y, x, i=i, j=0) for i in range(N_basis)], -1).squeeze(1)
+            dy_t = torch.stack([dde.grad.jacobian(y, x, i=i, j=1) for i in range(N_basis)], -1).squeeze(1)
+            dy_xx = torch.stack([dde.grad.hessian(y, x, component=k, i=0, j=0) for k in range(N_basis)], -1).squeeze(1)
+        
         dde.gradients.clear()
-        return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx, dy_x
+        return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx, dy_x, dy_t, dy_xx
 
     def periodic_bc_loss(self, y, dy_x):
         batch_size = y.shape[0]
@@ -161,7 +268,7 @@ class LitDeepOnet(pl.LightningModule):
             # Required to compute the PDE residual correctly
             pred = self.flat_forward(ic_vals, grid)
             # TODO: Compute IC/BC/RES losses
-            residual, dy_x = self.pde(grid, pred)
+            residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
         batch_size = grid_shape[0]
         residual = residual.reshape(batch_size, -1)
         residual_loss = (
@@ -200,7 +307,7 @@ class LitDeepOnet(pl.LightningModule):
             # Required to compute the PDE residual correctly
             pred = self.flat_forward(ic_vals, grid)
             # TODO: Compute IC/BC/RES losses
-            residual, dy_x = self.pde(grid, pred)
+            residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
         batch_size = grid_shape[0]
         residual = residual.reshape(batch_size, -1)
         residual_loss = nn.MSELoss()(residual, torch.zeros_like(residual))
@@ -288,7 +395,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     # sub = 2**6 #subsampling rate
     sub = 2**13 // s  # subsampling rate (step size)
 
-    batch_size = 20
+    batch_size = 2
     learning_rate = 1e-3
 
     epochs = 500  # default 500
@@ -320,7 +427,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         val_set, batch_size=batch_size, shuffle=False
     )
 
-    model = LitDeepOnet(lr=learning_rate, nx=101, n_samples=2500)
+    model = LitDeepOnet(lr=learning_rate, nx=101, n_samples=750, N_basis=75, constrain=True)
 
     trainer = pl.Trainer(
         accelerator="gpu",
