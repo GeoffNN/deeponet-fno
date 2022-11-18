@@ -163,7 +163,7 @@ def FNO_main(train_data_res, save_index):
     ################################################################
     
     # Data is of the shape (number of samples, grid size)
-    dataloader = MatReader('burgers_data_R10.mat')
+    dataloader = MatReader('/home/ubuntu/deeponet-fno/data/burgers/burgers_data_R10.mat')
     x_data = dataloader.read_field('a')[:,::sub]
     y_data = dataloader.read_field('u')[:,::sub]
     
@@ -255,63 +255,63 @@ def FNO_main(train_data_res, save_index):
     # ====================================
     # saving settings
     # ====================================
-    # current_directory = os.getcwd()
-    # resolution = "TrainRes_"+str(train_data_res)
-    # folder_index = str(save_index)
+    current_directory = os.getcwd()
+    resolution = "TrainRes_"+str(train_data_res)
+    folder_index = str(save_index)
     
-    # results_dir = "/results/" + resolution +"/" + folder_index +"/"
-    # save_results_to = current_directory + results_dir
-    # if not os.path.exists(save_results_to):
-    #     os.makedirs(save_results_to)
+    results_dir = "/results/" + resolution +"/" + folder_index +"/"
+    save_results_to = current_directory + results_dir
+    if not os.path.exists(save_results_to):
+        os.makedirs(save_results_to)
         
-    # model_dir = "/model/" + resolution +"/" + folder_index +"/"
-    # save_models_to = current_directory + model_dir
-    # if not os.path.exists(save_models_to):
-    #     os.makedirs(save_models_to)
+    model_dir = "/model/" + resolution +"/" + folder_index +"/"
+    save_models_to = current_directory + model_dir
+    if not os.path.exists(save_models_to):
+        os.makedirs(save_models_to)
     
     
     ################################################################
     # testing
     ################################################################
-    # torch.save(model, save_models_to+'fourier_burgers')
+    torch.save(model, save_models_to+'fourier_burgers')
     
-    # test_data_res_list = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    # for test_data_res in test_data_res_list:
-    #     s = test_data_res
-    #     sub = 2**13//s
+    test_data_res_list = [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+    for test_data_res in test_data_res_list:
+        s = test_data_res
+        sub = 2**13//s
     
-    #     x_data = dataloader.read_field('a')[:,::sub]
-    #     y_data = dataloader.read_field('u')[:,::sub]
-    #     x_test = x_data[-ntest:,:]
-    #     y_test = y_data[-ntest:,:]
-    #     grid = grid_all[::sub,:]
-    #     grid = torch.tensor(grid, dtype=torch.float)
-    #     x_test = torch.cat([x_test.reshape(ntest,s,1), grid.repeat(ntest,1,1)], dim=2)
-    #     test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=1, shuffle=False)
-    #     pred = torch.zeros(y_test.shape)
-    #     index = 0
+        x_data = dataloader.read_field('a')[:,::sub]
+        y_data = dataloader.read_field('u')[:,::sub]
+        x_test = x_data[-ntest:,:]
+        y_test = y_data[-ntest:,:]
+        grid = grid_all[::sub,:]
+        grid = torch.tensor(grid, dtype=torch.float)
+        x_test = torch.cat([x_test.reshape(ntest,s,1), grid.repeat(ntest,1,1)], dim=2)
+        test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=1, shuffle=False)
+        pred = torch.zeros(y_test.shape)
+        index = 0
         
-    #     t1 = default_timer()
-    #     with torch.no_grad():
-    #         for x, y in test_loader:
-    #             test_l2 = 0
-    #             x, y = x.cuda(), y.cuda()
+        t1 = default_timer()
+        with torch.no_grad():
+            for x, y in test_loader:
+                test_l2 = 0
+                x, y = x.cuda(), y.cuda()
         
-    #             out = model(x)
-    #             pred[index] = out.squeeze()
+                out = model(x)
+                pred[index] = out.squeeze()
         
-    #             test_l2 += myloss(out.view(1, -1), y.view(1, -1)).item()
-    #             # print(index, test_l2)
-    #             index = index + 1
-    #     t2 = default_timer()
-    #     testing_time = t2-t1
+                test_l2 += myloss(out.view(1, -1), y.view(1, -1)).item()
+                # print(index, test_l2)
+                index = index + 1
+        t2 = default_timer()
+        testing_time = t2-t1
     
-    #     # scipy.io.savemat('pred/burger_test.mat', mdict={'pred': pred.cpu().numpy()})
-    #     scipy.io.savemat(save_results_to+'burger_test_'+str(test_data_res)+'.mat', 
-    #                       mdict={'x_test': dataloader.read_field('a')[-ntest:,::sub].numpy(),
-    #                             'y_test': y_test.numpy(), 
-    #                             'y_pred': pred.cpu().numpy(),
-    #                             'testing_time': testing_time})
+        # scipy.io.savemat('pred/burger_test.mat', mdict={'pred': pred.cpu().numpy()})
+        scipy.io.savemat(save_results_to+'burger_test_'+str(test_data_res)+'.mat', 
+                          mdict={'x_test': dataloader.read_field('a')[-ntest:,::sub].numpy(),
+                                'y_test': y_test.numpy(), 
+                                'y_pred': pred.cpu().numpy(),
+                                'testing_time': testing_time})
 
 
 if __name__ == "__main__":
