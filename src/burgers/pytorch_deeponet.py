@@ -524,12 +524,22 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
 
     model = LitDeepOnet(lr=args.lr, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
 
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        save_top_k=10,
+        monitor="train_loss",
+        every_n_train_steps=30 if args.Nbasis > 1 else None,
+        mode="min",
+        filename="model-{epoch:02d}-{train_loss:.2f}",
+
+    )
+
     trainer = pl.Trainer(
         accelerator="gpu",
         gpus=args.ngpus,
         # precision=64,
+        enable_checkpointing=True,
         log_every_n_steps=args.log_every_n_steps,
-        callbacks=[EarlyStopping(monitor="val_mse_loss", mode="min", patience=3)],
+        callbacks=[EarlyStopping(monitor="val_mse_loss", mode="min", patience=3), checkpoint_callback],
         check_val_every_n_epoch=1,
     )
     trainer.fit(
