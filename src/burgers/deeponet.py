@@ -17,7 +17,7 @@ def get_data(ntrain, ntest):
     sub_y = 2 ** 6
 
     # Data is of the shape (number of samples = 2048, grid size = 2^13)
-    data = io.loadmat("burgers_data_R10.mat")
+    data = io.loadmat("/home/ubuntu/deeponet-fno/data/burgers/burgers_data_R10.mat")
     x_data = data["a"][:, ::sub_x].astype(np.float32)
     y_data = data["u"][:, ::sub_y].astype(np.float32)
     x_branch_train = x_data[:ntrain, :]
