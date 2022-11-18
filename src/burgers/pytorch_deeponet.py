@@ -181,46 +181,51 @@ class LitDeepOnet(pl.LightningModule):
         def ridge_error_fn(optim_vars, aux_vars):
             del aux_vars
             w, = optim_vars
-            return self.ridge * w.tensor
+            return w.tensor
         
         objective = th.Objective()
-        objective.device = pred.device
-        w_th = th.Vector(self.N_basis, name='w')  # Linear combination weight 
-        y_th = th.Variable(pred, 'y')
-        dy_x_th = th.Variable(dy_x, 'dy_x')
-        dy_t_th = th.Variable(dy_t, 'dy_t')
-        dy_xx_th = th.Variable(dy_xx, 'dy_xx') 
 
-        ic_vals_th = th.Variable(ic_vals, 'ic_vals')
-        ic_vals_pred_th = th.Variable(ic_vals_pred, 'ic_vals_pred')
+        w_th = th.Vector(self.N_basis, name='w', dtype=torch.double)  # Linear combination weight 
+        y_th = th.Variable(pred.double(), 'y')
+        dy_x_th = th.Variable(dy_x.double(), 'dy_x')
+        dy_t_th = th.Variable(dy_t.double(), 'dy_t')
+        dy_xx_th = th.Variable(dy_xx.double(), 'dy_xx') 
 
-        bc_diff_th =th.Variable(bc_diff, 'bc_diff')
+        ic_vals_th = th.Variable(ic_vals.double(), 'ic_vals')
+        ic_vals_pred_th = th.Variable(ic_vals_pred.double(), 'ic_vals_pred')
+
+        bc_diff_th =th.Variable(bc_diff.double(), 'bc_diff')
     
         optim_vars = [w_th]
         aux_vars = [y_th, dy_x_th, dy_t_th, dy_xx_th, ic_vals_th]
 
         pde_cost_function = th.AutoDiffCostFunction(
             optim_vars, pde_residual_error_fn, dim=self.n_samples, 
-             aux_vars=[y_th, dy_x_th, dy_t_th, dy_xx_th], name="pde_residual_cost_fn"
+             aux_vars=[y_th, dy_x_th, dy_t_th, dy_xx_th], name="pde_residual_cost_fn",
+             cost_weight=th.ScaleCostWeight(1., dtype=torch.double)
         )
         ic_cost_function = th.AutoDiffCostFunction(
             optim_vars, ic_error_fn, dim=self.nx, 
-             aux_vars=[ic_vals_pred_th, ic_vals_th], name="ic_cost_fn"
+             aux_vars=[ic_vals_pred_th, ic_vals_th], name="ic_cost_fn",
+             cost_weight=th.ScaleCostWeight(1., dtype=torch.double)
         )
         bc_cost_function = th.AutoDiffCostFunction(
             optim_vars, bc_error_fn, dim=self.nx * 2,
-             aux_vars=[bc_diff_th], name="bc_cost_fn"
+             aux_vars=[bc_diff_th], name="bc_cost_fn",
+             cost_weight=th.ScaleCostWeight(1., dtype=torch.double)
         )
 
         ridge_cost_function = th.AutoDiffCostFunction(
             optim_vars, ridge_error_fn, dim=self.N_basis,
-             aux_vars=[], name="ridge_cost_fn"
+             aux_vars=[], name="ridge_cost_fn",
+             cost_weight=th.ScaleCostWeight(self.ridge, dtype=torch.double)
         )
-        objective = th.Objective()
+        objective = th.Objective(dtype=torch.double)
         objective.add(pde_cost_function)
         objective.add(ic_cost_function)
         objective.add(bc_cost_function)
         objective.add(ridge_cost_function)
+
         objective.to(pred.device)
 
         optimizer = th.LevenbergMarquardt(
@@ -228,24 +233,29 @@ class LitDeepOnet(pl.LightningModule):
             max_iterations=self.max_iterations,
             step_size=0.5,
         )
+        # optimizer = th.GaussNewton(
+        #     objective,
+        #     max_iterations=self.max_iterations,
+        #     step_size=0.5,
+        # )
         theseus_optim = th.TheseusLayer(optimizer)
 
         theseus_inputs = {
-            "dy_x": dy_x,
-            "dy_t": dy_t,
-            "dy_xx": dy_xx,
-            "bc_diff": bc_diff,
-            "ic_vals": ic_vals,
-            "ic_vals_pred": ic_vals_pred,
-            "y": pred,
-            "w": torch.rand(batch_size, self.N_basis, device=pred.device)
+            "dy_x": dy_x.double(),
+            "dy_t": dy_t.double(),
+            "dy_xx": dy_xx.double(),
+            "bc_diff": bc_diff.double(),
+            "ic_vals": ic_vals.double(),
+            "ic_vals_pred": ic_vals_pred.double(),
+            "y": pred.double(),
+            "w": torch.rand(batch_size, self.N_basis, device=pred.device, dtype=torch.double)
         }
 
 
         updated_inputs, info = theseus_optim.forward(theseus_inputs)
         print(info)
 
-        w = updated_inputs['w']
+        w = updated_inputs['w'].float()
         return w
 
 
@@ -323,6 +333,7 @@ class LitDeepOnet(pl.LightningModule):
         grid_shape = grid.shape
         pred_shape = grid_shape[:-1] + (1,)
         grid = grid.reshape(-1, 2)
+        # Sample a subset of the grid
         with torch.enable_grad():
             grid.requires_grad = True
             # Required to compute the PDE residual correctly
