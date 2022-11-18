@@ -1,3 +1,5 @@
+import argparse
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -21,6 +23,8 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from torch.utils.data import Dataset
 
 import deepxde as dde
+
+# torch.set_default_dtype(torch.float64)
 
 print("\n=============================")
 print("torch.cuda.is_available(): " + str(torch.cuda.is_available()))
@@ -67,7 +71,7 @@ def reduce_last_dim(mat, w):
 
 
 class LitDeepOnet(pl.LightningModule):
-    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200):
+    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200, ridge=1e-4):
         super().__init__()
         self.lr = lr
         self.nx = nx
@@ -76,31 +80,32 @@ class LitDeepOnet(pl.LightningModule):
         self.constrain = constrain
         self.N_basis = N_basis
         self.max_iterations = max_iterations
+        self.ridge = ridge
 
         self.trunk_net = nn.Sequential(
-            nn.Linear(2, 128),
+            nn.Linear(2, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128 if not self.constrain else N_basis),
+            nn.Linear(100, 100 if not self.constrain else N_basis),
         )
 
         self.branch_net = nn.Sequential(
-            nn.Linear(nx, 128),
+            nn.Linear(nx, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(100, 100),
         )
 
         self.save_hyperparameters()
@@ -152,7 +157,6 @@ class LitDeepOnet(pl.LightningModule):
         ], -2)
 
         def pde_residual_error_fn(optim_vars, aux_vars):
-            # TODO: Add IC / BC 
             y, dy_x, dy_t, dy_xx = aux_vars 
             w, = optim_vars
             y_tensor, dy_x_tensor, dy_t_tensor, dy_xx_tensor = map(functools.partial(reduce_last_dim, w=w.tensor), (y.tensor, dy_x.tensor, dy_t.tensor, dy_xx.tensor))
@@ -161,18 +165,21 @@ class LitDeepOnet(pl.LightningModule):
             return residual_tensor
 
         def ic_error_fn(optim_vars, aux_vars):
-            # TODO: Add IC / BC 
             ic_vals_pred, ic_vals = aux_vars 
             w, = optim_vars
             y_tensor = reduce_last_dim(ic_vals_pred.tensor, w.tensor)
-            return y_tensor - ic_vals.tensor
+            return (y_tensor - ic_vals.tensor)
 
         def bc_error_fn(optim_vars, aux_vars):
-            # TODO: Add IC / BC 
             bc_diff, = aux_vars 
             w, = optim_vars
             diff_tensor = reduce_last_dim(bc_diff.tensor, w.tensor)
             return diff_tensor
+
+        def ridge_error_fn(optim_vars, aux_vars):
+            del aux_vars
+            w, = optim_vars
+            return self.ridge * w.tensor
         
         objective = th.Objective()
         objective.device = pred.device
@@ -199,14 +206,20 @@ class LitDeepOnet(pl.LightningModule):
              aux_vars=[ic_vals_pred_th, ic_vals_th], name="ic_cost_fn"
         )
         bc_cost_function = th.AutoDiffCostFunction(
-            optim_vars, bc_error_fn, dim=self.nx,
+            optim_vars, bc_error_fn, dim=self.nx * 2,
              aux_vars=[bc_diff_th], name="bc_cost_fn"
         )
+
+        ridge_cost_function = th.AutoDiffCostFunction(
+            optim_vars, ridge_error_fn, dim=self.N_basis,
+             aux_vars=[], name="ridge_cost_fn"
+        )
         objective = th.Objective()
-        objective.to(pred.device)
-        # objective.add(pde_cost_function)
+        objective.add(pde_cost_function)
         objective.add(ic_cost_function)
-        # objective.add(bc_cost_function)
+        objective.add(bc_cost_function)
+        objective.add(ridge_cost_function)
+        objective.to(pred.device)
 
         optimizer = th.LevenbergMarquardt(
             objective,
@@ -219,11 +232,16 @@ class LitDeepOnet(pl.LightningModule):
             "dy_x": dy_x,
             "dy_t": dy_t,
             "dy_xx": dy_xx,
+            "bc_diff": bc_diff,
+            "ic_vals": ic_vals,
+            "ic_vals_pred": ic_vals_pred,
             "y": pred,
             "w": torch.rand(batch_size, self.N_basis, device=pred.device)
         }
 
+
         updated_inputs, info = theseus_optim.forward(theseus_inputs)
+        print(info)
 
         w = updated_inputs['w']
         return w
@@ -368,6 +386,7 @@ class LitDeepOnet(pl.LightningModule):
             plt.savefig(
                 os.path.join(self.figure_dir, f"prediction_train_epoch_{self.current_epoch}_batch_{batch_idx}")
             )
+            plt.close()
 
 
         return train_loss
@@ -442,6 +461,8 @@ class LitDeepOnet(pl.LightningModule):
             os.path.join(self.figure_dir, f"prediction_epoch_{self.current_epoch}")
         )
 
+        plt.close()
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
@@ -466,19 +487,18 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     #  configurations
     ################################################################
 
-    s = train_data_res
-    # sub = 2**6 #subsampling rate
-    sub = 2**13 // s  # subsampling rate (step size)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch", type=int, default=3, help='batch size')
+    parser.add_argument("--lr", type=float, default=1e-3, help='learning rate')
+    parser.add_argument("--ridge", type=float, default=1e-4, help='ridge regularization for nonlinear solver')
+    parser.add_argument("--epochs", type=int, default=500, help='number of epochs')
+    parser.add_argument("--nsamples", type=int, default=500, help="Number of samples for the interior constraint")
+    parser.add_argument("--Nbasis", type=int, default=75, help="Number of basis functions. If 1, reduces to PhysicsInformed DeepONets.")
+    parser.add_argument("--ngpus", type=int, default=1, help="Number of gpus to use. For now only 1 seems to work.")
+    parser.add_argument("--max_iterations", type=int, default=30, help="Max interations for nonlinear LS solver")
+    parser.add_argument("--log_every_n_steps", type=int, default=1)
 
-    batch_size = 3
-    learning_rate = 1e-3
-
-    epochs = 500  # default 500
-    step_size = 100  # default 100
-    gamma = 0.5
-
-    modes = 16
-    width = 64
+    args = parser.parse_args()
 
     ################################################################
     # read training data
@@ -494,21 +514,23 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
 
     train_loader = torch.utils.data.DataLoader(
         train_set,
-        batch_size=batch_size,
+        batch_size=args.batch,
         shuffle=True,
         generator=torch.Generator("cuda"),
     )
     test_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=batch_size, shuffle=False
+        val_set, batch_size=args.batch, shuffle=False
     )
 
-    model = LitDeepOnet(lr=learning_rate, nx=101, n_samples=750, N_basis=150, constrain=True, max_iterations=200)
+    model = LitDeepOnet(lr=args.lr, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        gpus=1,
+        gpus=args.ngpus,
+        # precision=64,
+        log_every_n_steps=args.log_every_n_steps,
         callbacks=[EarlyStopping(monitor="val_mse_loss", mode="min", patience=3)],
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,
     )
     trainer.fit(
         model=model, train_dataloaders=train_loader, val_dataloaders=test_loader
