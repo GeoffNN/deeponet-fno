@@ -2,20 +2,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
 import matplotlib.pyplot as plt
 
 
 import functools
 import os
-import time
-import operator
-from functools import reduce
-from functools import partial
-from timeit import default_timer
 from utilities3 import *
-import scipy
+
 
 import theseus as th
 
