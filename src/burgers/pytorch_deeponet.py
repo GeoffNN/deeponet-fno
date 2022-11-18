@@ -71,7 +71,7 @@ def reduce_last_dim(mat, w):
 
 
 class LitDeepOnet(pl.LightningModule):
-    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200, ridge=1e-4):
+    def __init__(self, lr=1e-3, lr_scheduler_step=2000, lr_scheduler_factor=.9, nx=101, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200, ridge=1e-4):
         super().__init__()
         self.lr = lr
         self.nx = nx
@@ -81,6 +81,8 @@ class LitDeepOnet(pl.LightningModule):
         self.N_basis = N_basis
         self.max_iterations = max_iterations
         self.ridge = ridge
+        self.lr_scheduler_step = lr_scheduler_step
+        self.lr_scheduler_factor = lr_scheduler_factor
 
         self.trunk_net = nn.Sequential(
             nn.Linear(2, 100),
@@ -388,6 +390,8 @@ class LitDeepOnet(pl.LightningModule):
             )
             plt.close()
 
+            self.lr_scheduler.step()
+
 
         return train_loss
 
@@ -465,6 +469,7 @@ class LitDeepOnet(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        self.lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.lr_scheduler_step, gamma=self.lr_scheduler_factor)
         return optimizer
 
 
@@ -490,6 +495,8 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=3, help='batch size')
     parser.add_argument("--lr", type=float, default=1e-3, help='learning rate')
+    parser.add_argument("--lr_scheduler_step", type=float, default=2000, help='Number of training steps before decaying the learning rate.')
+    parser.add_argument("--lr_scheduler_factor", type=float, default=.9, help='Factor for lr decrease.')
     parser.add_argument("--ridge", type=float, default=1e-4, help='ridge regularization for nonlinear solver')
     parser.add_argument("--epochs", type=int, default=500, help='number of epochs')
     parser.add_argument("--nsamples", type=int, default=500, help="Number of samples for the interior constraint")
@@ -522,7 +529,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         val_set, batch_size=args.batch, shuffle=False
     )
 
-    model = LitDeepOnet(lr=args.lr, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
+    model = LitDeepOnet(lr=args.lr,lr_scheduler_step=args.lr_scheduler_step, lr_scheduler_factor=args.lr_scheduler_factor, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         save_top_k=10,
@@ -539,7 +546,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         # precision=64,
         enable_checkpointing=True,
         log_every_n_steps=args.log_every_n_steps,
-        callbacks=[EarlyStopping(monitor="val_mse_loss", mode="min", patience=3), checkpoint_callback],
+        callbacks=[checkpoint_callback],
         check_val_every_n_epoch=1,
     )
     trainer.fit(
