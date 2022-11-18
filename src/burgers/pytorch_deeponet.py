@@ -74,7 +74,7 @@ def reduce_last_dim(mat, w):
 
 
 class LitDeepOnet(pl.LightningModule):
-    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600):
+    def __init__(self, lr, nx, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200):
         super().__init__()
         self.lr = lr
         self.nx = nx
@@ -82,6 +82,7 @@ class LitDeepOnet(pl.LightningModule):
         self.n_samples = n_samples
         self.constrain = constrain
         self.N_basis = N_basis
+        self.max_iterations = max_iterations
 
         self.trunk_net = nn.Sequential(
             nn.Linear(2, 128),
@@ -137,7 +138,27 @@ class LitDeepOnet(pl.LightningModule):
         dy_xx = dy_xx.reshape(batch_size, self.n_samples, self.N_basis)
         pred = pred.reshape(batch_size, self.n_samples, self.N_basis)
 
-        def quad_error_fn(optim_vars, aux_vars):
+        # compute forward on IC 
+        ic_vals_pred = self.trunk_net(grid[:, :, 0])
+
+        # Compute pred and dy_x on the boundary
+        boundary_grid = torch.stack(
+            [grid[:, 0], grid[:, -1]], 1
+            ).reshape(-1, 2).detach() # (b, 2, nt, 2)
+        boundary_grid.requires_grad = True
+
+        pred_boundaries = self.trunk_net(boundary_grid)
+        residual_bc, dy_x_bc, dy_t_bc, dy_xx_bc = self.pde(boundary_grid, pred_boundaries)
+
+        pred_boundaries = pred_boundaries.reshape(batch_size, 2, self.nx, -1)
+        dy_x_bc = dy_x_bc.reshape_as(pred_boundaries)
+
+        bc_diff = torch.concat([
+            (pred_boundaries[:, 0] - pred_boundaries[:, -1]).reshape(batch_size, self.nx, self.N_basis),
+            (dy_x_bc[:, 0] - dy_x_bc[:, -1]).reshape(batch_size, self.nx, self.N_basis)
+        ], -2)
+
+        def pde_residual_error_fn(optim_vars, aux_vars):
             # TODO: Add IC / BC 
             y, dy_x, dy_t, dy_xx = aux_vars 
             w, = optim_vars
@@ -146,11 +167,19 @@ class LitDeepOnet(pl.LightningModule):
 
             return residual_tensor
 
-        def ridge_error_fn(optim_vars, aux_vars):
-            del aux_vars 
+        def ic_error_fn(optim_vars, aux_vars):
+            # TODO: Add IC / BC 
+            ic_vals_pred, ic_vals = aux_vars 
             w, = optim_vars
-            # TODO: ridge scale as a model parameter
-            return 1e-7 * w.tensor.reshape(batch_size, self.N_basis)
+            y_tensor = reduce_last_dim(ic_vals_pred.tensor, w.tensor)
+            return y_tensor - ic_vals.tensor
+
+        def bc_error_fn(optim_vars, aux_vars):
+            # TODO: Add IC / BC 
+            bc_diff, = aux_vars 
+            w, = optim_vars
+            diff_tensor = reduce_last_dim(bc_diff.tensor, w.tensor)
+            return diff_tensor
         
         objective = th.Objective()
         objective.device = pred.device
@@ -160,25 +189,35 @@ class LitDeepOnet(pl.LightningModule):
         dy_t_th = th.Variable(dy_t, 'dy_t')
         dy_xx_th = th.Variable(dy_xx, 'dy_xx') 
 
-        optim_vars = [w_th]
-        aux_vars = [y_th, dy_x_th, dy_t_th, dy_xx_th]
+        ic_vals_th = th.Variable(ic_vals, 'ic_vals')
+        ic_vals_pred_th = th.Variable(ic_vals_pred, 'ic_vals_pred')
 
-        cost_function = th.AutoDiffCostFunction(
-            optim_vars, quad_error_fn, dim=self.n_samples,  # TODO: Update to n_samples + n_ic + n_bc
-             aux_vars=aux_vars, name="pde_residual_cost_fn"
+        bc_diff_th =th.Variable(bc_diff, 'bc_diff')
+    
+        optim_vars = [w_th]
+        aux_vars = [y_th, dy_x_th, dy_t_th, dy_xx_th, ic_vals_th]
+
+        pde_cost_function = th.AutoDiffCostFunction(
+            optim_vars, pde_residual_error_fn, dim=self.n_samples, 
+             aux_vars=[y_th, dy_x_th, dy_t_th, dy_xx_th], name="pde_residual_cost_fn"
         )
-        ridge_function = th.AutoDiffCostFunction(
-            optim_vars, quad_error_fn, dim=self.N_basis,  # TODO: Update to n_samples + n_ic + n_bc
-             aux_vars=aux_vars, name="ridge"
+        ic_cost_function = th.AutoDiffCostFunction(
+            optim_vars, ic_error_fn, dim=self.nx, 
+             aux_vars=[ic_vals_pred_th, ic_vals_th], name="ic_cost_fn"
+        )
+        bc_cost_function = th.AutoDiffCostFunction(
+            optim_vars, bc_error_fn, dim=self.nx,
+             aux_vars=[bc_diff_th], name="bc_cost_fn"
         )
         objective = th.Objective()
         objective.to(pred.device)
-        objective.add(cost_function)
-        # objective.add(ridge_function)
+        # objective.add(pde_cost_function)
+        objective.add(ic_cost_function)
+        # objective.add(bc_cost_function)
 
         optimizer = th.LevenbergMarquardt(
             objective,
-            max_iterations=50,
+            max_iterations=self.max_iterations,
             step_size=0.5,
         )
         theseus_optim = th.TheseusLayer(optimizer)
@@ -244,17 +283,25 @@ class LitDeepOnet(pl.LightningModule):
         dde.gradients.clear()
         return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx, dy_x, dy_t, dy_xx
 
-    def periodic_bc_loss(self, y, dy_x):
+    def periodic_bc_diff(self, y, dy_x):
+        # y, dy_x are the full predictions, w/ shape (b, nx, nt, 1)
         batch_size = y.shape[0]
         zero_order = (y[:, 0] - y[:, -1]).reshape(batch_size, -1)
         first_order = (dy_x[:, 0] - dy_x[:, -1]).reshape(batch_size, -1)
-        dim = zero_order.shape[-1]
+
+        return torch.concat(
+            [zero_order, first_order], -1
+        )
+
+    def periodic_bc_loss(self, y, dy_x):
+        diff = self.periodic_bc_diff(y, dy_x)
+        dim = diff.shape[-1] / 2
         return (
             1
             / dim
             * (
-                nn.MSELoss()(zero_order, torch.zeros_like(zero_order))
-                + nn.MSELoss()(first_order, torch.zeros_like(first_order))
+                nn.MSELoss()(diff, torch.zeros_like(diff))
+                + nn.MSELoss()(diff, torch.zeros_like(diff))
             )
         )
 
@@ -294,8 +341,43 @@ class LitDeepOnet(pl.LightningModule):
         self.log("train_residual_loss", residual_loss.item())
         train_loss = residual_loss + ic_loss + bc_loss
         self.log("train_loss", train_loss.item())
+
+        if batch_idx % 20 == 0:
+            self.figure_dir = os.path.join(self.trainer.log_dir, "figures")
+            os.makedirs(self.figure_dir, exist_ok=True)
+            fig, axes = plt.subplots(ncols=3)
+
+            vmin = min(pred.reshape(pred_shape)[0].min(), target[0].min()).cpu()
+            vmax = max(pred.reshape(pred_shape)[0].min(), target[0].max()).cpu()
+
+            axes[0].imshow(
+                pred.detach().reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
+                vmin=vmin,
+                vmax=vmax,
+                cmap="RdBu",
+            )
+            axes[0].set_title("Pred")
+            axes[1].imshow(
+                target[0].reshape(self.nx, self.nx).cpu(), vmin=vmin, vmax=vmax, cmap="RdBu"
+            )
+            axes[1].set_title("Target")
+            axes[2].imshow(
+                (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu(),
+                vmin=-max(abs(vmin), abs(vmax)),
+                vmax=max(abs(vmin), abs(vmax)),
+                cmap="RdBu",
+            )
+            axes[2].set_title("Difference")
+            for ax in axes:
+                ax.axis("off")
+
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(self.figure_dir, f"prediction_train_epoch_{self.current_epoch}_batch_{batch_idx}")
+            )
+
+
         return train_loss
-        return mse_loss
 
     def validation_step(self, batch, batch_idx):
         (ic_vals, grid), target = batch
@@ -395,7 +477,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     # sub = 2**6 #subsampling rate
     sub = 2**13 // s  # subsampling rate (step size)
 
-    batch_size = 2
+    batch_size = 3
     learning_rate = 1e-3
 
     epochs = 500  # default 500
@@ -427,7 +509,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         val_set, batch_size=batch_size, shuffle=False
     )
 
-    model = LitDeepOnet(lr=learning_rate, nx=101, n_samples=750, N_basis=75, constrain=True)
+    model = LitDeepOnet(lr=learning_rate, nx=101, n_samples=750, N_basis=150, constrain=True, max_iterations=200)
 
     trainer = pl.Trainer(
         accelerator="gpu",
