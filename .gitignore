@@ -1,0 +1,9 @@
+lightning_logs/
+results/
+model/
+*.png
+*.zip
+*.json
+*.mat
+*.pyc
+*.code-workspace

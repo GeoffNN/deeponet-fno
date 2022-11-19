@@ -660,7 +660,6 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         # profiler='pytorch',  # Doesn't work
         accelerator="gpu",
         devices=args.ngpus,
-        # strategy='ddp',
         # precision=64,
         enable_checkpointing=True,
         log_every_n_steps=args.log_every_n_steps,
