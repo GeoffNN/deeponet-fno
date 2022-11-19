@@ -1,5 +1,7 @@
 import argparse
 
+from functorch import jacfwd, vmap, jacrev
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -66,17 +68,18 @@ class BurgersDeepONetDataset(Dataset):
 
 
 def reduce_last_dim(mat, w):
-    return (mat * w[:, None]).sum(-1)
+     return (mat * w[:, None]).sum(-1)
     
 
 
 class LitDeepOnet(pl.LightningModule):
-    def __init__(self, lr=1e-3, lr_scheduler_step=2000, lr_scheduler_factor=.9, nx=101, n_samples=2500, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200, ridge=1e-4):
+    def __init__(self, lr=1e-3, lr_scheduler_step=2000, lr_scheduler_factor=.9, nx=101, n_samples=750, n_samples_residual=250, viscosity=1e-2, constrain=False, N_basis=600, max_iterations=200, ridge=1e-4):
         super().__init__()
         self.lr = lr
         self.nx = nx
         self.viscosity = viscosity
         self.n_samples = n_samples
+        self.n_samples_residual = n_samples_residual
         self.constrain = constrain
         self.N_basis = N_basis
         self.max_iterations = max_iterations
@@ -131,8 +134,12 @@ class LitDeepOnet(pl.LightningModule):
         flat_sampled_grid.requires_grad = True
         pred = self.trunk_net(flat_sampled_grid)
 
-        residual, dy_x, dy_t, dy_xx = self.pde(flat_sampled_grid, pred)
-        residual = residual.reshape(batch_size, self.n_samples, self.N_basis)
+        dy = vmap(jacfwd(self.trunk_net))(flat_sampled_grid)
+        dy_x = dy[..., 0]
+        dy_t = dy[..., 1]
+
+        dy_xx = vmap(jacrev(jacfwd(self.trunk_net)))(flat_sampled_grid)[..., 0, 0]
+
         dy_x =  dy_x.reshape(batch_size, self.n_samples, self.N_basis)
         dy_t = dy_t.reshape(batch_size, self.n_samples, self.N_basis)
         dy_xx = dy_xx.reshape(batch_size, self.n_samples, self.N_basis)
@@ -266,13 +273,23 @@ class LitDeepOnet(pl.LightningModule):
           grid: shape (-1, 2)
         Returns:
           pred: shape (-1, 1)
+          residual: shape(-1, 1) -- Only if self.constrain
         """
         grid = grid.reshape(-1, self.nx, self.nx, 2)
         batch_size = grid.shape[0]
         if self.constrain:
             trunk_rep = self.trunk_net(grid).reshape(batch_size, -1, self.N_basis)
             w = self.fit_linear_combo(ic_vals, grid)  # This is the branch rep
-            return reduce_last_dim(trunk_rep, w).reshape(-1, 1)
+            y = reduce_last_dim(trunk_rep, w).reshape(-1, 1)
+
+            # Sample points in the interior to compute the PDE residual loss
+            torch.randperm(self.nx * self.nx)[:self.n_samples]
+            sampled_idx = torch.randperm(grid.reshape(-1, 2).shape[0])[:self.n_samples_residual]
+            sampled_grid = grid.reshape(-1, 2)[sampled_idx]
+            sampled_trunk_rep = self.trunk_net(sampled_grid)
+            _,  trunk_dy_x, trunk_dy_t, trunk_dy_xx=  self.pde(sampled_grid, sampled_trunk_rep)
+            y_sampled, dy_x, dy_t, dy_xx = map(functools.partial(reduce_last_dim, w=w), (sampled_trunk_rep, trunk_dy_x, trunk_dy_t, trunk_dy_xx))
+            return y, self.burgers(y_sampled, dy_x, dy_t, dy_xx), w
 
         else:
             trunk_rep = self.trunk_net(grid)
@@ -291,20 +308,27 @@ class LitDeepOnet(pl.LightningModule):
         trunk_rep = self.trunk_net(grid)
         branch_rep = self.branch_net(ic_vals)[:, None, None]
         return (trunk_rep * branch_rep).sum(-1, keepdim=True)
+    
+    def burgers(self, y, dy_x, dy_t, dy_xx):
+        return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx
 
     def pde(self, x, y):
         N_basis = y.shape[-1]
         if N_basis == 1:
+            # TODO: functorch this too
             dy_x = dde.grad.jacobian(y, x, i=0, j=0)
             dy_t = dde.grad.jacobian(y, x, i=0, j=1)
             dy_xx = dde.grad.hessian(y, x, i=0, j=0)
+            dde.gradients.clear()
         else:
-            dy_x = torch.stack([dde.grad.jacobian(y, x, i=i, j=0) for i in range(N_basis)], -1).squeeze(1)
-            dy_t = torch.stack([dde.grad.jacobian(y, x, i=i, j=1) for i in range(N_basis)], -1).squeeze(1)
-            dy_xx = torch.stack([dde.grad.hessian(y, x, component=k, i=0, j=0) for k in range(N_basis)], -1).squeeze(1)
+            # Make sure x is flattened to avoid memory blowup/wrong jacobians
+            shape = x.shape[:-1] + (N_basis,)
+            dy = vmap(jacfwd(self.trunk_net))(x.reshape(-1, 2))
+            dy_x = dy[..., 0].reshape(*shape)
+            dy_t = dy[..., 1].reshape(*shape)
+            dy_xx = vmap(jacrev(jacfwd(self.trunk_net)))(x.reshape(-1, 2))[..., 0, 0].reshape(*shape)
         
-        dde.gradients.clear()
-        return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx, dy_x, dy_t, dy_xx
+        return self.burgers(y, dy_x, dy_t, dy_xx), dy_x, dy_t, dy_xx
 
     def periodic_bc_diff(self, y, dy_x):
         # y, dy_x are the full predictions, w/ shape (b, nx, nt, 1)
@@ -330,25 +354,48 @@ class LitDeepOnet(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         (ic_vals, grid), target = batch
+        batch_size = grid.shape[0]
         grid_shape = grid.shape
         pred_shape = grid_shape[:-1] + (1,)
         grid = grid.reshape(-1, 2)
         # Sample a subset of the grid
-        with torch.enable_grad():
-            grid.requires_grad = True
-            # Required to compute the PDE residual correctly
-            pred = self.flat_forward(ic_vals, grid)
-            # TODO: Compute IC/BC/RES losses
-            residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
+        if self.constrain:
+            pred, residual, w = self.flat_forward(ic_vals, grid)
+            y_boundary_diff = pred.reshape(*pred_shape)[:, 0] - pred.reshape(*pred_shape)[:, -1]
+            y_boundary_diff = y_boundary_diff.reshape(batch_size, -1)
+            dy_x_trunk_boundary = vmap(jacfwd(self.trunk_net))(
+                torch.stack(
+                    [grid.reshape(*grid_shape)[:, 0],
+                    grid.reshape(*grid_shape)[:, -1]]
+                    , 1
+                ).reshape(-1, 2))[..., 0]
+            dy_x_trunk_boundary = dy_x_trunk_boundary.reshape(batch_size, -1, self.N_basis)
+            dy_x_boundary = reduce_last_dim(dy_x_trunk_boundary, w).reshape(batch_size, 2, -1)
+            dy_x_boundary_diff = dy_x_boundary[:, 0] - dy_x_boundary[:, -1]
+            dy_x_boundary_diff = dy_x_boundary_diff.reshape(batch_size, -1)
+            full_boundary_diff = torch.concat([y_boundary_diff, dy_x_boundary_diff], -1)
+        else:
+            with torch.enable_grad():
+                grid.requires_grad = True
+                # Required to compute the PDE residual correctly
+                pred = self.flat_forward(ic_vals, grid)
+                # TODO: Compute IC/BC/RES losses
+                residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
         batch_size = grid_shape[0]
         residual = residual.reshape(batch_size, -1)
         residual_loss = (
             1 / residual.shape[-1] * nn.MSELoss()(residual, torch.zeros_like(residual))
         )
 
-        bc_loss = self.periodic_bc_loss(
-            pred.reshape(*pred_shape), dy_x.reshape(*pred_shape)
-        )
+        if self.constrain:
+            bc_loss = nn.MSELoss()(
+                full_boundary_diff,
+                torch.zeros_like(full_boundary_diff)
+            )
+        else:
+            bc_loss = self.periodic_bc_loss(
+                pred.reshape(*pred_shape), dy_x.reshape(*pred_shape)
+            )
 
         ic_loss = nn.MSELoss()(
             ic_vals, pred.reshape(pred_shape)[:, :, 0].reshape(batch_size, -1)
@@ -408,29 +455,51 @@ class LitDeepOnet(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         (ic_vals, grid), target = batch
+        batch_size = grid.shape[0]
         grid_shape = grid.shape
         pred_shape = grid_shape[:-1] + (1,)
         grid = grid.reshape(-1, 2)
-        with torch.enable_grad():
-            grid.requires_grad = True
-            # Required to compute the PDE residual correctly
-            pred = self.flat_forward(ic_vals, grid)
-            # TODO: Compute IC/BC/RES losses
-            residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
+        # Sample a subset of the grid
+        if self.constrain:
+            pred, residual, w = self.flat_forward(ic_vals, grid)
+            y_boundary_diff = pred.reshape(*pred_shape)[:, 0] - pred.reshape(*pred_shape)[:, -1]
+            y_boundary_diff = y_boundary_diff.reshape(batch_size, -1)
+            dy_x_trunk_boundary = vmap(jacfwd(self.trunk_net))(
+                torch.stack(
+                    [grid.reshape(*grid_shape)[:, 0],
+                    grid.reshape(*grid_shape)[:, -1]]
+                    , 1
+                ).reshape(-1, 2))[..., 0]
+            dy_x_trunk_boundary = dy_x_trunk_boundary.reshape(batch_size, -1, self.N_basis)
+            dy_x_boundary = reduce_last_dim(dy_x_trunk_boundary, w).reshape(batch_size, 2, -1)
+            dy_x_boundary_diff = dy_x_boundary[:, 0] - dy_x_boundary[:, -1]
+            dy_x_boundary_diff = dy_x_boundary_diff.reshape(batch_size, -1)
+            full_boundary_diff = torch.concat([y_boundary_diff, dy_x_boundary_diff], -1)
+        else:
+            with torch.enable_grad():
+                grid.requires_grad = True
+                # Required to compute the PDE residual correctly
+                pred = self.flat_forward(ic_vals, grid)
+                # TODO: Compute IC/BC/RES losses
+                residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
         batch_size = grid_shape[0]
         residual = residual.reshape(batch_size, -1)
-        residual_loss = nn.MSELoss()(residual, torch.zeros_like(residual))
-
-        bc_loss = self.periodic_bc_loss(
-            pred.reshape(*pred_shape), dy_x.reshape(*pred_shape)
+        residual_loss = (
+            1 / residual.shape[-1] * nn.MSELoss()(residual, torch.zeros_like(residual))
         )
 
-        ic_loss = (
-            1
-            / pred.shape[-1]
-            * nn.MSELoss()(
-                ic_vals, pred.reshape(pred_shape)[:, :, 0].reshape(batch_size, -1)
+        if self.constrain:
+            bc_loss = nn.MSELoss()(
+                full_boundary_diff,
+                torch.zeros_like(full_boundary_diff)
             )
+        else:
+            bc_loss = self.periodic_bc_loss(
+                pred.reshape(*pred_shape), dy_x.reshape(*pred_shape)
+            )
+
+        ic_loss = nn.MSELoss()(
+            ic_vals, pred.reshape(pred_shape)[:, :, 0].reshape(batch_size, -1)
         )
 
         batch_size = pred.shape[0]
@@ -504,7 +573,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     ################################################################
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=3, help='batch size')
+    parser.add_argument("--batch", type=int, default=5, help='batch size')
     parser.add_argument("--lr", type=float, default=1e-3, help='learning rate')
     parser.add_argument("--lr_scheduler_step", type=float, default=2000, help='Number of training steps before decaying the learning rate.')
     parser.add_argument("--lr_scheduler_factor", type=float, default=.9, help='Factor for lr decrease.')
@@ -518,6 +587,8 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
 
     args = parser.parse_args()
 
+    print(args, "\n")
+
     ################################################################
     # read training data
     ################################################################
@@ -527,7 +598,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     )
     # TODO: generate and change path
     val_set = BurgersDeepONetDataset(
-        "/home/ubuntu/deeponet-fno/data/burgers/Burgers_test_10.mat"
+        "/home/ubuntu/deeponet-fno/data/burgers/Burger_test_50.mat"
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -552,6 +623,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     )
 
     trainer = pl.Trainer(
+        # profiler='pytorch',  # Doesn't work
         accelerator="gpu",
         gpus=args.ngpus,
         # precision=64,
