@@ -3,6 +3,9 @@ import argparse
 from functorch import jacfwd, vmap, jacrev
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -98,20 +101,20 @@ class LitDeepOnet(pl.LightningModule):
             nn.Tanh(),
             nn.Linear(100, 100 if not self.constrain else N_basis),
         )
-
-        self.branch_net = nn.Sequential(
-            nn.Linear(nx, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-            nn.Tanh(),
-            nn.Linear(100, 100),
-        )
+        if not self.constrain:
+            self.branch_net = nn.Sequential(
+                nn.Linear(nx, 100),
+                nn.Tanh(),
+                nn.Linear(100, 100),
+                nn.Tanh(),
+                nn.Linear(100, 100),
+                nn.Tanh(),
+                nn.Linear(100, 100),
+                nn.Tanh(),
+                nn.Linear(100, 100),
+                nn.Tanh(),
+                nn.Linear(100, 100),
+            )
 
         self.save_hyperparameters()
 
@@ -420,24 +423,38 @@ class LitDeepOnet(pl.LightningModule):
 
             vmin = min(pred.reshape(pred_shape)[0].min(), target[0].min()).cpu()
             vmax = max(pred.reshape(pred_shape)[0].min(), target[0].max()).cpu()
+            
+            dividers = list(map(make_axes_locatable, axes))
 
-            axes[0].imshow(
+            im0 = axes[0].imshow(
                 pred.detach().reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
                 vmin=vmin,
                 vmax=vmax,
                 cmap="RdBu",
             )
+            cax0 = dividers[0].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im0, cax=cax0, orientation='vertical')
+
             axes[0].set_title("Pred")
-            axes[1].imshow(
+            im1 = axes[1].imshow(
                 target[0].reshape(self.nx, self.nx).cpu(), vmin=vmin, vmax=vmax, cmap="RdBu"
             )
+
+            cax1 = dividers[1].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im0, cax=cax1, orientation='vertical')
+
             axes[1].set_title("Target")
-            axes[2].imshow(
-                (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu(),
-                vmin=-max(abs(vmin), abs(vmax)),
-                vmax=max(abs(vmin), abs(vmax)),
+            diff = (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu()
+            im2 = axes[2].imshow(
+                diff,
+                vmin=-abs(diff).max(),
+                vmax=abs(diff).max(),
                 cmap="RdBu",
             )
+
+            cax2 = dividers[2].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im2, cax=cax2, orientation='vertical')
+
             axes[2].set_title("Difference")
             for ax in axes:
                 ax.axis("off")
@@ -518,34 +535,48 @@ class LitDeepOnet(pl.LightningModule):
 
         vmin = min(pred.reshape(pred_shape)[0].min(), target[0].min()).cpu()
         vmax = max(pred.reshape(pred_shape)[0].min(), target[0].max()).cpu()
+        
+        dividers = list(map(make_axes_locatable, axes))
 
-        axes[0].imshow(
-            pred.reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
+        im0 = axes[0].imshow(
+            pred.detach().reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
             vmin=vmin,
             vmax=vmax,
             cmap="RdBu",
         )
+        cax0 = dividers[0].append_axes('right', size='5%', pad=0.05)
+        fig.colorbar(im0, cax=cax0, orientation='vertical')
+
         axes[0].set_title("Pred")
-        axes[1].imshow(
+        im1 = axes[1].imshow(
             target[0].reshape(self.nx, self.nx).cpu(), vmin=vmin, vmax=vmax, cmap="RdBu"
         )
+
+        cax1 = dividers[1].append_axes('right', size='5%', pad=0.05)
+        fig.colorbar(im1, cax=cax1, orientation='vertical')
+
         axes[1].set_title("Target")
-        axes[2].imshow(
-            (pred.reshape(pred_shape) - target)[0].reshape(self.nx, self.nx).cpu(),
-            vmin=-max(abs(vmin), abs(vmax)),
-            vmax=max(abs(vmin), abs(vmax)),
+        diff = (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu()
+        im2 = axes[2].imshow(
+            diff,
+            vmin=-abs(diff).max(),
+            vmax=abs(diff).max(),
             cmap="RdBu",
         )
+
+        cax2 = dividers[2].append_axes('right', size='5%', pad=0.05)
+        fig.colorbar(im2, cax=cax2, orientation='vertical')
+
         axes[2].set_title("Difference")
         for ax in axes:
             ax.axis("off")
 
         plt.tight_layout()
         plt.savefig(
-            os.path.join(self.figure_dir, f"prediction_epoch_{self.current_epoch}")
+            os.path.join(self.figure_dir, f"prediction_train_epoch_{self.current_epoch}_batch_{batch_idx}")
         )
-
         plt.close()
+
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -580,6 +611,7 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     parser.add_argument("--ridge", type=float, default=1e-4, help='ridge regularization for nonlinear solver')
     parser.add_argument("--epochs", type=int, default=500, help='number of epochs')
     parser.add_argument("--nsamples", type=int, default=500, help="Number of samples for the interior constraint")
+    parser.add_argument("--nsamples_residual", type=int, default=250, help="Number of samples for the residual loss.")
     parser.add_argument("--Nbasis", type=int, default=75, help="Number of basis functions. If 1, reduces to PhysicsInformed DeepONets.")
     parser.add_argument("--ngpus", type=int, default=1, help="Number of gpus to use. For now only 1 seems to work.")
     parser.add_argument("--max_iterations", type=int, default=30, help="Max interations for nonlinear LS solver")
@@ -605,10 +637,12 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
         train_set,
         batch_size=args.batch,
         shuffle=True,
-        generator=torch.Generator("cuda"),
+        # generator=torch.Generator("cuda"),
+        pin_memory=True
     )
     test_loader = torch.utils.data.DataLoader(
-        val_set, batch_size=args.batch, shuffle=False
+        val_set, batch_size=args.batch, shuffle=False,
+        pin_memory=True
     )
 
     model = LitDeepOnet(lr=args.lr,lr_scheduler_step=args.lr_scheduler_step, lr_scheduler_factor=args.lr_scheduler_factor, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
@@ -625,7 +659,8 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     trainer = pl.Trainer(
         # profiler='pytorch',  # Doesn't work
         accelerator="gpu",
-        gpus=args.ngpus,
+        devices=args.ngpus,
+        # strategy='ddp',
         # precision=64,
         enable_checkpointing=True,
         log_every_n_steps=args.log_every_n_steps,
