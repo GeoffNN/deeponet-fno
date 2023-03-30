@@ -29,13 +29,15 @@ from torch.utils.data import Dataset
 
 import deepxde as dde
 
-# torch.set_default_dtype(torch.float64)
+from pytorch_lightning.loggers import WandbLogger
+
 
 print("\n=============================")
 print("torch.cuda.is_available(): " + str(torch.cuda.is_available()))
 if torch.cuda.is_available():
     print("torch.cuda.get_device_name(0): " + str(torch.cuda.get_device_name(0)))
 print("=============================\n")
+
 
 
 class BurgersDeepONetDataset(Dataset):
@@ -99,6 +101,10 @@ class LitDeepOnet(pl.LightningModule):
             nn.Tanh(),
             nn.Linear(100, 100),
             nn.Tanh(),
+            # nn.Linear(100, 100),
+            # nn.Tanh(),
+            # nn.Linear(100, 100),
+            # nn.Tanh(),
             nn.Linear(100, 100 if not self.constrain else N_basis),
         )
         if not self.constrain:
@@ -114,6 +120,10 @@ class LitDeepOnet(pl.LightningModule):
                 nn.Linear(100, 100),
                 nn.Tanh(),
                 nn.Linear(100, 100),
+                # nn.Tanh(),
+                # nn.Linear(100, 100),
+                # nn.Tanh(),
+                # nn.Linear(100, 100),
             )
 
         self.save_hyperparameters()
@@ -172,7 +182,7 @@ class LitDeepOnet(pl.LightningModule):
             y, dy_x, dy_t, dy_xx = aux_vars 
             w, = optim_vars
             y_tensor, dy_x_tensor, dy_t_tensor, dy_xx_tensor = map(functools.partial(reduce_last_dim, w=w.tensor), (y.tensor, dy_x.tensor, dy_t.tensor, dy_xx.tensor))
-            residual_tensor = dy_t_tensor + y_tensor * dy_x_tensor - self.viscosity / np.pi * dy_xx_tensor
+            residual_tensor = dy_t_tensor + y_tensor * dy_x_tensor - self.viscosity * dy_xx_tensor
 
             return residual_tensor
 
@@ -217,7 +227,7 @@ class LitDeepOnet(pl.LightningModule):
         ic_cost_function = th.AutoDiffCostFunction(
             optim_vars, ic_error_fn, dim=self.nx, 
              aux_vars=[ic_vals_pred_th, ic_vals_th], name="ic_cost_fn",
-             cost_weight=th.ScaleCostWeight(1., dtype=torch.double)
+             cost_weight=th.ScaleCostWeight(20., dtype=torch.double)
         )
         bc_cost_function = th.AutoDiffCostFunction(
             optim_vars, bc_error_fn, dim=self.nx * 2,
@@ -277,6 +287,7 @@ class LitDeepOnet(pl.LightningModule):
         Returns:
           pred: shape (-1, 1)
           residual: shape(-1, 1) -- Only if self.constrain
+          w: shape (batch, N_basis) -- Only if self.constrain
         """
         grid = grid.reshape(-1, self.nx, self.nx, 2)
         batch_size = grid.shape[0]
@@ -286,7 +297,7 @@ class LitDeepOnet(pl.LightningModule):
             y = reduce_last_dim(trunk_rep, w).reshape(-1, 1)
 
             # Sample points in the interior to compute the PDE residual loss
-            torch.randperm(self.nx * self.nx)[:self.n_samples]
+            # torch.randperm(self.nx * self.nx)[:self.n_samples]
             sampled_idx = torch.randperm(grid.reshape(-1, 2).shape[0])[:self.n_samples_residual]
             sampled_grid = grid.reshape(-1, 2)[sampled_idx]
             sampled_trunk_rep = self.trunk_net(sampled_grid)
@@ -313,7 +324,7 @@ class LitDeepOnet(pl.LightningModule):
         return (trunk_rep * branch_rep).sum(-1, keepdim=True)
     
     def burgers(self, y, dy_x, dy_t, dy_xx):
-        return dy_t + y * dy_x - self.viscosity / np.pi * dy_xx
+        return dy_t + y * dy_x - self.viscosity * dy_xx
 
     def pde(self, x, y):
         N_basis = y.shape[-1]
@@ -386,34 +397,41 @@ class LitDeepOnet(pl.LightningModule):
                 residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
         batch_size = grid_shape[0]
         residual = residual.reshape(batch_size, -1)
+        sampled_residual = residual[:, torch.randperm(residual.shape[-1])[:self.n_samples_residual]]
         residual_loss = (
-            1 / residual.shape[-1] * nn.MSELoss()(residual, torch.zeros_like(residual))
+            nn.MSELoss()(sampled_residual, torch.zeros_like(sampled_residual))
         )
 
         if self.constrain:
             bc_loss = nn.MSELoss()(
                 full_boundary_diff,
                 torch.zeros_like(full_boundary_diff)
-            )
+            ) * self.n_samples_residual
         else:
             bc_loss = self.periodic_bc_loss(
                 pred.reshape(*pred_shape), dy_x.reshape(*pred_shape)
-            )
+            ) * self.n_samples_residual
 
         ic_loss = nn.MSELoss()(
             ic_vals, pred.reshape(pred_shape)[:, :, 0].reshape(batch_size, -1)
-        )
+        ) * self.n_samples_residual
 
-        batch_size = pred.shape[0]
+        batch_size = pred_shape[0]
         mse_loss = nn.MSELoss()(
             pred.reshape(batch_size, -1), target.reshape(batch_size, -1)
         )
 
+        train_loss = 0.
+        train_loss += residual_loss + (20 * ic_loss + bc_loss)
+        
+        relative_errors = [get_relative_error(pred_i, target_i) for pred_i, target_i in zip(pred.reshape(batch_size, -1), target.reshape(batch_size, -1))]
+
+        self.log("train_relative_error", np.mean(relative_errors))
         self.log("train_ic_loss", ic_loss.item())
         self.log("train_bc_loss", bc_loss.item())
         self.log("train_mse_loss", mse_loss.item())
         self.log("train_residual_loss", residual_loss.item())
-        train_loss = residual_loss + ic_loss + bc_loss
+        
         self.log("train_loss", train_loss.item())
 
         if batch_idx % 20 == 0:
@@ -463,9 +481,10 @@ class LitDeepOnet(pl.LightningModule):
             plt.savefig(
                 os.path.join(self.figure_dir, f"prediction_train_epoch_{self.current_epoch}_batch_{batch_idx}")
             )
+            self.logger.log_image("train_plot", [fig])
             plt.close()
 
-            self.lr_scheduler.step()
+        self.lr_scheduler.step()
 
 
         return train_loss
@@ -529,59 +548,88 @@ class LitDeepOnet(pl.LightningModule):
         self.log("val_mse_loss", mse_loss.item())
         self.log("val_residual_loss", residual_loss.item())
 
+        relative_errors = [get_relative_error(pred_i, target_i) for pred_i, target_i in zip(pred.reshape(batch_size, -1), target.reshape(batch_size, -1))]
+        self.log("val_relative_error", np.mean(relative_errors))
+
         self.figure_dir = os.path.join(self.trainer.log_dir, "figures")
         os.makedirs(self.figure_dir, exist_ok=True)
-        fig, axes = plt.subplots(ncols=3)
+        if batch_idx % 20 == 0:
+            fig, axes = plt.subplots(ncols=3)
 
-        vmin = min(pred.reshape(pred_shape)[0].min(), target[0].min()).cpu()
-        vmax = max(pred.reshape(pred_shape)[0].min(), target[0].max()).cpu()
-        
-        dividers = list(map(make_axes_locatable, axes))
+            vmin = min(pred.reshape(pred_shape)[0].min(), target[0].min()).cpu()
+            vmax = max(pred.reshape(pred_shape)[0].min(), target[0].max()).cpu()
+            
+            dividers = list(map(make_axes_locatable, axes))
 
-        im0 = axes[0].imshow(
-            pred.detach().reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
-            vmin=vmin,
-            vmax=vmax,
-            cmap="RdBu",
+            im0 = axes[0].imshow(
+                pred.detach().reshape(pred_shape)[0].reshape(self.nx, self.nx).cpu(),
+                vmin=vmin,
+                vmax=vmax,
+                cmap="RdBu",
+            )
+            cax0 = dividers[0].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im0, cax=cax0, orientation='vertical')
+
+            axes[0].set_title("Pred")
+            im1 = axes[1].imshow(
+                target[0].reshape(self.nx, self.nx).cpu(), vmin=vmin, vmax=vmax, cmap="RdBu"
+            )
+
+            cax1 = dividers[1].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im1, cax=cax1, orientation='vertical')
+
+            axes[1].set_title("Target")
+            diff = (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu()
+            im2 = axes[2].imshow(
+                diff,
+                vmin=-abs(diff).max(),
+                vmax=abs(diff).max(),
+                cmap="RdBu",
+            )
+
+            cax2 = dividers[2].append_axes('right', size='5%', pad=0.05)
+            fig.colorbar(im2, cax=cax2, orientation='vertical')
+
+            axes[2].set_title("Difference")
+            for ax in axes:
+                ax.axis("off")
+
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(self.figure_dir, f"prediction_val_epoch_{self.current_epoch}_batch_{batch_idx}")
+            )
+            self.logger.log_image("val_plot", [fig])
+            plt.close()
+
+    def test_step(self, batch, batch_idx):
+        (ic_vals, grid), target = batch
+        batch_size = grid.shape[0]
+        grid_shape = grid.shape
+        pred_shape = grid_shape[:-1] + (1,)
+        grid = grid.reshape(-1, 2)
+        # Sample a subset of the grid
+        if self.constrain:
+            pred, residual, w = self.flat_forward(ic_vals, grid)
+        else:
+            with torch.enable_grad():
+                grid.requires_grad = True
+                # Required to compute the PDE residual correctly
+                pred = self.flat_forward(ic_vals, grid)
+                # TODO: Compute IC/BC/RES losses
+                residual, dy_x, dy_t, dy_xx = self.pde(grid, pred)
+        batch_size = grid_shape[0]
+        residual = residual.reshape(batch_size, -1)
+        residual_loss = (
+            1 / residual.shape[-1] * nn.MSELoss()(residual, torch.zeros_like(residual))
         )
-        cax0 = dividers[0].append_axes('right', size='5%', pad=0.05)
-        fig.colorbar(im0, cax=cax0, orientation='vertical')
 
-        axes[0].set_title("Pred")
-        im1 = axes[1].imshow(
-            target[0].reshape(self.nx, self.nx).cpu(), vmin=vmin, vmax=vmax, cmap="RdBu"
-        )
-
-        cax1 = dividers[1].append_axes('right', size='5%', pad=0.05)
-        fig.colorbar(im1, cax=cax1, orientation='vertical')
-
-        axes[1].set_title("Target")
-        diff = (pred.reshape(pred_shape) - target).detach()[0].reshape(self.nx, self.nx).cpu()
-        im2 = axes[2].imshow(
-            diff,
-            vmin=-abs(diff).max(),
-            vmax=abs(diff).max(),
-            cmap="RdBu",
-        )
-
-        cax2 = dividers[2].append_axes('right', size='5%', pad=0.05)
-        fig.colorbar(im2, cax=cax2, orientation='vertical')
-
-        axes[2].set_title("Difference")
-        for ax in axes:
-            ax.axis("off")
-
-        plt.tight_layout()
-        plt.savefig(
-            os.path.join(self.figure_dir, f"prediction_train_epoch_{self.current_epoch}_batch_{batch_idx}")
-        )
-        plt.close()
+        return pred.reshape(*pred_shape), target, residual_loss
 
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=self.lr_scheduler_step, gamma=self.lr_scheduler_factor)
-        return optimizer
+        return [optimizer], [{"scheduler": self.lr_scheduler, "interval": "step"}]
 
 
 def periodic(x):
@@ -614,57 +662,66 @@ def DeepONet_main(train_data_res, save_index, if_constrain=False):
     parser.add_argument("--nsamples_residual", type=int, default=250, help="Number of samples for the residual loss.")
     parser.add_argument("--Nbasis", type=int, default=75, help="Number of basis functions. If 1, reduces to PhysicsInformed DeepONets.")
     parser.add_argument("--ngpus", type=int, default=1, help="Number of gpus to use. For now only 1 seems to work.")
-    parser.add_argument("--max_iterations", type=int, default=30, help="Max interations for nonlinear LS solver")
+    parser.add_argument("--max_iterations", type=int, default=50, help="Max interations for nonlinear LS solver")
     parser.add_argument("--log_every_n_steps", type=int, default=1)
+    parser.add_argument("--viscosity", default=1e-2, type=float, help="viscosity of the fluid")
 
     args = parser.parse_args()
 
     print(args, "\n")
+
+    wandb_logger = WandbLogger(project="PDEs-Burgers", save_dir="logs")
+    wandb_logger.experiment.config.update(vars(args))
 
     ################################################################
     # read training data
     ################################################################
 
     train_set = BurgersDeepONetDataset(
-        "/home/ubuntu/deeponet-fno/data/burgers/burgers_train_1000.mat"
+        # "/home/negroni/deeponet-fno/data/burgers/Burgers_train_1000_nov22.mat"
+        "/home/negroni/deeponet-fno/data/burgers/Burgers_train_1000_visc_0.01_Feb23.mat"
     )
-    # TODO: generate and change path
+
     val_set = BurgersDeepONetDataset(
-        "/home/ubuntu/deeponet-fno/data/burgers/Burger_test_50.mat"
+        # "/home/negroni/deeponet-fno/data/burgers/Burger_test_50_nov22.mat"
+        "/home/negroni/deeponet-fno/data/burgers/Burgers_test_50_visc_0.01_Feb23.mat"
     )
 
     train_loader = torch.utils.data.DataLoader(
         train_set,
         batch_size=args.batch,
         shuffle=True,
-        # generator=torch.Generator("cuda"),
-        pin_memory=True
+        pin_memory=True,
+        num_workers=40,
     )
     test_loader = torch.utils.data.DataLoader(
         val_set, batch_size=args.batch, shuffle=False,
         pin_memory=True
     )
 
-    model = LitDeepOnet(lr=args.lr,lr_scheduler_step=args.lr_scheduler_step, lr_scheduler_factor=args.lr_scheduler_factor, nx=101, n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations)
+    model = LitDeepOnet(lr=args.lr,lr_scheduler_step=args.lr_scheduler_step, lr_scheduler_factor=args.lr_scheduler_factor, nx=101, 
+                        n_samples=args.nsamples, N_basis=args.Nbasis, constrain=args.Nbasis > 1, max_iterations=args.max_iterations,
+                        viscosity=args.viscosity, n_samples_residual=args.nsamples_residual, ridge=args.ridge)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        save_top_k=10,
-        monitor="train_loss",
+        save_top_k=5,
+        monitor="val_mse_loss",
         every_n_train_steps=30 if args.Nbasis > 1 else None,
         mode="min",
-        filename="model-{epoch:02d}-{train_loss:.2f}",
-
+        filename="model-{epoch:02d}-{train_loss:.6f}",
     )
 
     trainer = pl.Trainer(
-        # profiler='pytorch',  # Doesn't work
         accelerator="gpu",
         devices=args.ngpus,
-        # precision=64,
+        strategy="ddp" if args.ngpus > 1 else None,
+        precision=64,
+        max_epochs=args.epochs,
         enable_checkpointing=True,
         log_every_n_steps=args.log_every_n_steps,
         callbacks=[checkpoint_callback],
         check_val_every_n_epoch=1,
+        logger=wandb_logger
     )
     trainer.fit(
         model=model, train_dataloaders=train_loader, val_dataloaders=test_loader
