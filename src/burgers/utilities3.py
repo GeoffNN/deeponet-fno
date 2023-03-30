@@ -307,3 +307,11 @@ def count_params(model):
     for p in list(model.parameters()):
         c += reduce(operator.mul, list(p.size()))
     return c
+
+
+def get_relative_error(pred, target):
+    pred = pred.detach().cpu()
+    target = target.cpu()
+    diff = pred.flatten() - target.flatten()
+    diff = np.nan_to_num(diff)
+    return np.linalg.norm(diff) / np.linalg.norm(target)
